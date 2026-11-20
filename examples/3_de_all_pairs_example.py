@@ -95,21 +95,29 @@ summary = tc.read_de_pairs(DE_SUMMARY)
 print(summary.nsmallest(10, 'score'))                              # most-similar pairs
 one_pair = tc.read_de_pairs(DE_PARQUET, pairs=[('3', '17')])     # per-gene detail for one pair
 
-# ---- cluster markers, via the ported R-validated functions ---------------------------------------
-# (validated against scrattch.bigcat: 428/428 clusters identical top-N lists, 12/12 identical
-# greedy marker sets -- docs/tests_aligning_to_bigcat/7_marker_queries_R_vs_python.md)
+# ---- cluster markers, via the ported scrattch.bigcat functions -----------------------------------
+# (docs/tests_aligning_to_bigcat/7_marker_queries_R_vs_python.md)
 all_clusters = list(cluster_assignments.keys())
 
-# top-N positive markers per cluster (R select_top_pos_markers_ds)
+# top-N positive markers per cluster (R select_top_pos_markers_ds; 428/428 identical to R)
 top_markers = select_top_pos_markers_ds(DE_PARQUET, clusters=all_clusters, n_markers=3)
 
-# coverage-based positive markers (R select_pos_markers_ds): keeps adding genes until every
-# cluster-vs-other comparison is covered n_markers times. n_markers=1, max_genes=20 is the exact
-# configuration validated against R (12/12 identical marker sets); out_dir caches per-cluster
-# results so a long run can resume. Optionally pass cl_means=means.T to enable R's fold-change
-# check (a supported branch, not part of the validated configuration).
-pos_markers = select_pos_markers_ds(DE_PARQUET, clusters=all_clusters, n_markers=1,
-                                    max_genes=20, out_dir=os.path.join(OUT_DIR, 'marker_cache'))
+# combo markers (R select_pos_markers_ds): keeps adding genes until every cluster-vs-other comparison
+# is covered n_markers times. Set as in yzizhen/joint_analysis/wb_multi/select_combo_markers.R.
+# Validated against R with cl_means=None, max_genes=20 (12/12 identical sets); the cl_means branch
+# is not yet compared end to end.
+pos_markers = select_pos_markers_ds(
+    DE_PARQUET,
+    clusters=all_clusters,      # R cl: the comparison set. Within-subclass markers: that subclass's clusters
+    select_cl=None,             # R select.cl: which clusters get markers (None = all of `clusters`)
+    genes=None,                 # R genes: candidate genes, e.g. select.markers or a TF list (None = all)
+    n_markers=1,                # R n.markers: times each comparison must be covered
+    max_genes=1000,             # R max.genes: cap on combo size (R default 50)
+    cl_means=means,             # R cl.means: clusters x genes, do NOT transpose (None = no fold-change check)
+    lfc_th=2 * np.log(2),       # R lfc.th=2 is log2; our means are ln
+    out_dir=os.path.join(OUT_DIR, 'marker_cache'),  # R out.dir: per-cluster cache
+    overwrite=False,            # False = reuse cached clusters, so a killed run resumes
+)
 
 pd.Series({c: ','.join(g) for c, g in top_markers.items()}, name='markers') \
   .rename_axis('cl').to_csv(os.path.join(OUT_DIR, 'cluster_top_markers.csv'))
