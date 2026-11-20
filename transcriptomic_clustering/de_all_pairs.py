@@ -16,10 +16,15 @@ bin.x=<X>/bin.y=<Y> covering both orientations.
 """
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
+import glob
 import itertools
 import json
+import logging
 import multiprocessing as mp
 import os
+import shutil
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import pandas as pd
@@ -95,8 +100,38 @@ def _write_partition(df: pd.DataFrame, root: str, bin_x: int, bin_y: int) -> Non
         ) from err
     d = _partition_path(root, bin_x, bin_y)
     os.makedirs(d, exist_ok=True)
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False),
-                   os.path.join(d, "part-0.parquet"))
+    # Write to a hidden temp name, then rename: a killed job never leaves a truncated part-0.parquet,
+    # and the '.' prefix keeps a leftover temp file invisible to pyarrow / R arrow dataset discovery.
+    tmp = os.path.join(d, ".part-0.parquet.tmp")
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), tmp)
+    os.replace(tmp, os.path.join(d, "part-0.parquet"))
+
+
+def _done_marker(root: str, bin_x: int, bin_y: int) -> str:
+    """Completion marker of one bin-pair task. Under '_done/', which dataset readers ignore."""
+    return os.path.join(root, "_done", f"{bin_x}_{bin_y}")
+
+
+def _mark_done(root: str, bin_x: int, bin_y: int) -> None:
+    path = _done_marker(root, bin_x, bin_y)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").close()
+
+
+def _check_resume_params(root: str, params: Dict[str, Any]) -> None:
+    """Refuse to resume into a dataset written with different parameters; record them otherwise."""
+    path = os.path.join(root, "_de_params.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            saved = json.load(f)
+        if saved != params:
+            msg = (f"{root} was written with different de_all_pairs parameters; resuming would mix "
+                   f"results. Pass overwrite=True or use a new directory.\n saved: {saved}\n now:   {params}")
+            logger.error(msg)
+            raise ValueError(msg)
+    os.makedirs(root, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(params, f, sort_keys=True)
 
 
 def _save_cl_bin(root: str, cl_bin: Dict[str, int]) -> None:
@@ -205,6 +240,10 @@ def _process_bin_pair(task):
     if c['summary_dir'] is not None:
         _write_partition(pd.DataFrame(rows), c['summary_dir'], bin_x, bin_y)
         rows = []
+    # marked only after every write of this task, so a resume never skips a half-written bin-pair
+    for root in (c['out_dir'], c['summary_dir']):
+        if root is not None:
+            _mark_done(root, bin_x, bin_y)
     return bin_x, bin_y, rows
 
 
@@ -327,6 +366,7 @@ def de_all_pairs(
         cl_bin: Optional[Dict[str, int]] = None,
         bin_size: int = 100,
         n_jobs: int = 1,
+        overwrite: bool = False,
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """
     Compute eBayes DE for ALL (or given) cluster pairs. Mirrors scrattch.bigcat de_all_pairs
@@ -350,6 +390,13 @@ def de_all_pairs(
               parallel tasks.
     n_jobs: worker processes (R mc.cores). On the on-disk path the unit of work is the bin-pair (as in
             R); in memory the pairs are chunked instead, so parallelism does not require writing files.
+    overwrite: on-disk path only (R de_selected_pairs overwrite, default FALSE). False resumes an
+               interrupted run: bin-pairs already completed in every output directory are skipped.
+               Completion is recorded per bin-pair only after all its files are written, and resuming
+               into a directory written with different thresholds / top_n / cl_bin raises. Changed
+               input statistics are NOT detected -- use overwrite=True or a new directory for new data.
+               Resuming requires summary_dir (the summary of skipped bin-pairs cannot be returned).
+               True recomputes everything.
 
     Returns
     -------
@@ -419,14 +466,38 @@ def de_all_pairs(
         # the on-disk layout depend on the core count. We keep bin_size fixed so a dataset is reproducible
         # and queryable regardless of n_jobs; parallelism comes from the number of bin-pairs instead.
         cl_bin = make_cl_bin(cluster_means.index, bin_size=bin_size)
-    for root in (out_dir, summary_dir):
-        if root is not None:
-            _save_cl_bin(root, cl_bin)
+    roots = [r for r in (out_dir, summary_dir) if r is not None]
+    if not overwrite and summary_dir is None:
+        logger.warning("de_all_pairs: resuming needs summary_dir; recomputing every bin-pair")
+    # Resume only a run this function started (it left _done/ markers); anything else starts fresh.
+    resume = (not overwrite and summary_dir is not None
+              and all(os.path.isdir(os.path.join(r, "_done")) for r in roots))
+    params = {'thresholds': filt, 'top_n': top_n, 'return_detail': bool(return_detail),
+              'cl_bin': {str(k): int(v) for k, v in cl_bin.items()}}
+    for root in roots:
+        if not resume:
+            # A fresh run clears what an earlier run left in this directory: stale partitions (other
+            # bins, or an orientation this run leaves empty) would be read back mixed with the new
+            # results, and stale markers would let a later resume skip work. Only our entries go.
+            for name in glob.glob(os.path.join(root, "bin.x=*")) + [os.path.join(root, "_done"),
+                                                                    os.path.join(root, "_de_params.json")]:
+                if os.path.isdir(name):
+                    shutil.rmtree(name)
+                elif os.path.exists(name):
+                    os.remove(name)
+        _check_resume_params(root, params)          # raises on mismatch; records params on a fresh run
+        os.makedirs(os.path.join(root, "_done"), exist_ok=True)
+        _save_cl_bin(root, cl_bin)
 
     by_bin: Dict[Tuple[int, int], List[Tuple[str, str]]] = defaultdict(list)
     for a, b in pairs:
         by_bin[_bin_pair(a, b, cl_bin)].append((a, b))
     tasks = sorted(by_bin.items())
+    if resume:
+        n_all = len(tasks)
+        tasks = [t for t in tasks if not all(os.path.exists(_done_marker(r, *t[0])) for r in roots)]
+        if len(tasks) < n_all:
+            logger.info(f"de_all_pairs: resuming, {n_all - len(tasks)} of {n_all} bin-pairs already done")
 
     want_detail = out_dir is not None and return_detail
     ctx = _make_ctx(want_detail, out_dir, summary_dir, cl_bin)

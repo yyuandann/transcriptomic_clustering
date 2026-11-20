@@ -93,6 +93,55 @@ def test_de_all_pairs_binned_roundtrip(cluster_stats, tmp_path):
     pd.testing.assert_frame_equal(back[expected.columns], expected)
 
 
+def _read_all(out_dir, summary_dir):
+    detail = read_de_pairs(out_dir).sort_values(["pair", "P1", "rank"]).reset_index(drop=True)
+    summary = read_de_pairs(summary_dir).sort_values("pair").reset_index(drop=True)
+    return detail, summary
+
+
+def test_de_all_pairs_resumes_after_interruption(cluster_stats, tmp_path):
+    """overwrite=False skips finished bin-pairs, recomputes unfinished ones, and matches a clean run."""
+    pytest.importorskip("pyarrow")
+    means, variances, present, cl_size = cluster_stats
+    kw = dict(top_n=5, bin_size=2)
+    ref = (str(tmp_path / "ref_d"), str(tmp_path / "ref_s"))
+    run = (str(tmp_path / "d"), str(tmp_path / "s"))
+    de_all_pairs(means, variances, present, cl_size, THRESHOLDS, out_dir=ref[0], summary_dir=ref[1], **kw)
+    de_all_pairs(means, variances, present, cl_size, THRESHOLDS, out_dir=run[0], summary_dir=run[1], **kw)
+
+    # simulate a kill inside bin-pair (1, 2): its detail was written, its summary and markers were not
+    for root in run:
+        os.remove(os.path.join(root, "_done", "1_2"))
+    os.remove(os.path.join(run[1], "bin.x=1", "bin.y=2", "part-0.parquet"))
+    done_file = os.path.join(run[0], "bin.x=3", "bin.y=3", "part-0.parquet")
+    mtime = os.path.getmtime(done_file)
+
+    de_all_pairs(means, variances, present, cl_size, THRESHOLDS, out_dir=run[0], summary_dir=run[1], **kw)
+    assert os.path.getmtime(done_file) == mtime, "a finished bin-pair must not be recomputed"
+    for got, expected in zip(_read_all(*run), _read_all(*ref)):
+        pd.testing.assert_frame_equal(got, expected)
+
+    with pytest.raises(ValueError, match="different de_all_pairs parameters"):
+        de_all_pairs(means, variances, present, cl_size, THRESHOLDS, out_dir=run[0], summary_dir=run[1],
+                     top_n=3, bin_size=2)
+
+
+def test_de_all_pairs_fresh_run_clears_stale_partitions(cluster_stats, tmp_path):
+    """Rewriting into a used directory must not leave partitions of the earlier layout behind."""
+    pytest.importorskip("pyarrow")
+    means, variances, present, cl_size = cluster_stats
+    out_dir, summary_dir = str(tmp_path / "d"), str(tmp_path / "s")
+    de_all_pairs(means, variances, present, cl_size, THRESHOLDS, top_n=5,
+                 out_dir=out_dir, summary_dir=summary_dir, bin_size=2)          # 3 bins
+    de_all_pairs(means, variances, present, cl_size, THRESHOLDS, top_n=5,
+                 out_dir=out_dir, summary_dir=summary_dir, bin_size=3, overwrite=True)   # 2 bins
+    assert sorted(os.listdir(out_dir)) == ["_cl_bin.json", "_de_params.json", "_done", "bin.x=1", "bin.x=2"]
+    summary_mem, _ = de_all_pairs(means, variances, present, cl_size, THRESHOLDS, top_n=5)
+    back = read_de_pairs(summary_dir).sort_values("pair").reset_index(drop=True)
+    pd.testing.assert_frame_equal(back[summary_mem.columns],
+                                  summary_mem.sort_values("pair").reset_index(drop=True))
+
+
 def test_logpval_is_not_capped():
     """
     R stores the raw -log10(padj) per gene and truncates only the copy it sums into the de score

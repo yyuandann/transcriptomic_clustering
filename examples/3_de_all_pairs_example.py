@@ -85,6 +85,8 @@ tc.de_all_pairs(
     summary_dir=DE_SUMMARY,
     cl_bin=cl_bin,
     n_jobs=16,                   # bin-pairs computed in parallel (R mc.cores)
+    overwrite=False,             # False: re-running after a kill resumes, skipping finished bin-pairs.
+                                 # True after changing the input data (new data is not detected).
 )
 
 # ---- query it -------------------------------------------------------------------------------------
