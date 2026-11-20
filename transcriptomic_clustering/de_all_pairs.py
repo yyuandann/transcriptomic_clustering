@@ -396,7 +396,10 @@ def de_all_pairs(
                into a directory written with different thresholds / top_n / cl_bin raises. Changed
                input statistics are NOT detected -- use overwrite=True or a new directory for new data.
                Resuming requires summary_dir (the summary of skipped bin-pairs cannot be returned).
-               True recomputes everything.
+               True is a FRESH START: before computing, it DELETES all previous de_all_pairs output in
+               out_dir and summary_dir (every bin.x=* partition, _done/, _de_params.json), then
+               recomputes every bin-pair. Other files in those directories are left alone. The same
+               clean-up happens with False when the directories hold no resumable run (no _done/).
 
     Returns
     -------

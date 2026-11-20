@@ -86,7 +86,9 @@ tc.de_all_pairs(
     cl_bin=cl_bin,
     n_jobs=16,                   # bin-pairs computed in parallel (R mc.cores)
     overwrite=False,             # False: re-running after a kill resumes, skipping finished bin-pairs.
-                                 # True after changing the input data (new data is not detected).
+                                 # True: fresh start -- DELETES all previous de_all_pairs output in
+                                 # DE_PARQUET / DE_SUMMARY first, then recomputes everything. Use it
+                                 # after changing the input data (new data is not detected on resume).
 )
 
 # ---- query it -------------------------------------------------------------------------------------
