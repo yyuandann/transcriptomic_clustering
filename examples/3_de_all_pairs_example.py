@@ -105,6 +105,10 @@ all_clusters = list(cluster_assignments.keys())
 
 # top-N positive markers per cluster (R select_top_pos_markers_ds; 428/428 identical to R)
 top_markers = select_top_pos_markers_ds(DE_PARQUET, clusters=all_clusters, n_markers=3)
+# write the top markers to csv: one row per cluster, genes comma-joined in rank order
+# (reading it back: end of script)
+pd.Series({c: ','.join(g) for c, g in top_markers.items()}, name='markers') \
+  .rename_axis('cl').to_csv(os.path.join(OUT_DIR, 'cluster_top_markers.csv'))
 
 # combo markers (R select_pos_markers_ds): keeps adding genes until every cluster-vs-other comparison
 # is covered n_markers times. Set as in yzizhen/joint_analysis/wb_multi/select_combo_markers.R.
@@ -123,6 +127,11 @@ pos_markers = select_pos_markers_ds(
     overwrite=False,            # False = reuse cached clusters, so a killed run resumes
     n_jobs=16,                  # R mc.cores: clusters computed in parallel, same result as serial
 )
+# write the combo markers to csv: same layout, genes in pick order
+pd.Series({c: ','.join(g) for c, g in pos_markers.items()}, name='markers') \
+  .rename_axis('cl').to_csv(os.path.join(OUT_DIR, 'cluster_combo_markers.csv'))
 
-pd.Series({c: ','.join(g) for c, g in top_markers.items()}, name='markers') \
-  .rename_axis('cl').to_csv(os.path.join(OUT_DIR, 'cluster_top_markers.csv'))
+# ---- reading a marker csv back into {cluster: [gene, ...]} (same code for either file) -------------
+# dtype keeps labels as strings ('1', not 1); an empty marker list is saved as a blank field.
+df = pd.read_csv(os.path.join(OUT_DIR, 'cluster_combo_markers.csv'), dtype={'cl': str}).fillna('')
+combo_markers = {c: s.split(',') if s else [] for c, s in zip(df['cl'], df['markers'])}
