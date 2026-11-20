@@ -108,8 +108,8 @@ top_markers = select_top_pos_markers_ds(DE_PARQUET, clusters=all_clusters, n_mar
 
 # combo markers (R select_pos_markers_ds): keeps adding genes until every cluster-vs-other comparison
 # is covered n_markers times. Set as in yzizhen/joint_analysis/wb_multi/select_combo_markers.R.
-# Validated against R with cl_means=None, max_genes=20 (12/12 identical sets); the cl_means branch
-# is not yet compared end to end.
+# Validated against R on all 428 clusters with this cl_means / lfc_th setup: 428/428 identical sets
+# (docs/tests_aligning_to_bigcat/7_marker_queries_R_vs_python.md).
 pos_markers = select_pos_markers_ds(
     DE_PARQUET,
     clusters=all_clusters,      # R cl: the comparison set. Within-subclass markers: that subclass's clusters
@@ -121,6 +121,7 @@ pos_markers = select_pos_markers_ds(
     lfc_th=2 * np.log(2),       # R lfc.th=2 is log2; our means are ln
     out_dir=os.path.join(OUT_DIR, 'marker_cache'),  # R out.dir: per-cluster cache
     overwrite=False,            # False = reuse cached clusters, so a killed run resumes
+    n_jobs=16,                  # R mc.cores: clusters computed in parallel, same result as serial
 )
 
 pd.Series({c: ','.join(g) for c, g in top_markers.items()}, name='markers') \

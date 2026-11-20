@@ -317,6 +317,23 @@ def test_select_pos_markers_ds_covers_pairs_the_top_marker_misses(tmp_path):
     assert (check_pairs_ds(root, to_add, combo['1'], cl_bin=cl_bin)['checked'] >= 1).all()
 
 
+def test_select_pos_markers_ds_parallel_matches_serial(cluster_stats, tmp_path):
+    """n_jobs only changes scheduling: same markers, in select_cl order, as a serial run."""
+    pytest.importorskip("pyarrow")
+    from transcriptomic_clustering.de_all_pairs import select_pos_markers_ds
+    means, variances, present, cl_size = cluster_stats
+    out_dir, summary_dir = str(tmp_path / "d"), str(tmp_path / "s")
+    de_all_pairs(means, variances, present, cl_size, THRESHOLDS, top_n=10,
+                 out_dir=out_dir, summary_dir=summary_dir, bin_size=2)
+    clusters = list(means.index)
+    select_cl = ['5', '1', '3', '6']
+    kw = dict(select_cl=select_cl, n_markers=2, max_genes=10, cl_means=means, lfc_th=0.5)
+    serial = select_pos_markers_ds(out_dir, clusters, **kw)
+    parallel = select_pos_markers_ds(out_dir, clusters, n_jobs=3, **kw)
+    assert any(serial.values())
+    assert parallel == serial and list(parallel) == select_cl
+
+
 def test_select_pos_markers_ds_cache_roundtrip(tmp_path):
     """out_dir/overwrite mirror R's per-cluster caching so a long run can resume."""
     from transcriptomic_clustering.de_all_pairs import select_pos_markers_ds

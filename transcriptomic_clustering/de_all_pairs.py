@@ -958,7 +958,8 @@ def select_pos_markers_ds(root: str,
                           lfc_th: float = 2.0,
                           out_dir: Optional[str] = None,
                           overwrite: bool = True,
-                          max_num: int = MAX_NUM) -> Dict[str, List[str]]:
+                          max_num: int = MAX_NUM,
+                          n_jobs: int = 1) -> Dict[str, List[str]]:
     """
     Positive markers for each cluster, covering every comparison against the other clusters.
     Mirrors R `select_pos_markers_ds`.
@@ -970,7 +971,10 @@ def select_pos_markers_ds(root: str,
     out_dir/overwrite mirror R's per-cluster caching (R writes <cl>.markers.rda; here JSON), so a
     long run can be resumed without recomputing clusters that already finished.
 
-    Returns {cluster: [gene, ...]}.
+    n_jobs: worker processes (R mc.cores). Clusters are independent, so the result is identical to
+            a serial run; each worker reads its own clusters' rows from `root`.
+
+    Returns {cluster: [gene, ...]}, in `select_cl` order.
     """
     clusters = [str(c) for c in clusters]
     select_cl = clusters if select_cl is None else [str(c) for c in select_cl]
@@ -978,22 +982,58 @@ def select_pos_markers_ds(root: str,
         os.makedirs(out_dir, exist_ok=True)
 
     result: Dict[str, List[str]] = {}
+    todo = []
     for cl in select_cl:
-        cache = os.path.join(out_dir, f"{str(cl).replace('/', '')}.markers.json") if out_dir else None
+        cache = _marker_cache_path(out_dir, cl)
         if cache and os.path.exists(cache) and not overwrite:
             with open(cache) as fh:
                 result[cl] = json.load(fh)
-            continue
-        others = [c for c in clusters if c != cl]
-        # load this cluster's rows once and reuse them through the greedy loop
-        de = _load_directed_detail(root, [(cl, o) for o in others], genes, cl_bin, max_num)
-        markers = select_markers_pair_group_ds(
-            root, [cl], others, genes=genes, cl_bin=cl_bin, n_markers=n_markers,
-            select_sign=('up',), max_genes=max_genes, cl_means=cl_means, lfc_th=lfc_th,
-            de=de, max_num=max_num,
-        )
-        result[cl] = markers
-        if cache:
-            with open(cache, "w") as fh:
-                json.dump(markers, fh)
-    return result
+        else:
+            todo.append(cl)
+
+    ctx = dict(root=root, clusters=clusters, genes=genes, cl_bin=cl_bin, n_markers=n_markers,
+               max_genes=max_genes, cl_means=cl_means, lfc_th=lfc_th, out_dir=out_dir, max_num=max_num)
+    if n_jobs > 1 and len(todo) > 1:
+        with mp.Pool(processes=min(n_jobs, len(todo)),
+                     initializer=_init_marker_worker, initargs=(ctx,)) as pool:
+            for cl, markers in pool.imap_unordered(_pos_markers_one_cluster, todo):
+                result[cl] = markers
+    else:
+        _init_marker_worker(ctx)
+        try:
+            for cl in todo:
+                result[cl] = _pos_markers_one_cluster(cl)[1]
+        finally:
+            _MARKER_CTX.clear()
+    return {cl: result[cl] for cl in select_cl}
+
+
+def _marker_cache_path(out_dir: Optional[str], cl: str) -> Optional[str]:
+    return os.path.join(out_dir, f"{str(cl).replace('/', '')}.markers.json") if out_dir else None
+
+
+# Per-worker context for select_pos_markers_ds: cl_means and the rest are shipped once per worker.
+_MARKER_CTX: Dict[str, Any] = {}
+
+
+def _init_marker_worker(ctx: Dict[str, Any]) -> None:
+    _MARKER_CTX.clear()
+    _MARKER_CTX.update(ctx)
+
+
+def _pos_markers_one_cluster(cl: str) -> Tuple[str, List[str]]:
+    """Combo markers of one cluster against all others; writes its cache file when out_dir is set."""
+    c = _MARKER_CTX
+    others = [o for o in c['clusters'] if o != cl]
+    # load this cluster's rows once and reuse them through the greedy loop
+    de = _load_directed_detail(c['root'], [(cl, o) for o in others], c['genes'], c['cl_bin'], c['max_num'])
+    markers = select_markers_pair_group_ds(
+        c['root'], [cl], others, genes=c['genes'], cl_bin=c['cl_bin'], n_markers=c['n_markers'],
+        select_sign=('up',), max_genes=c['max_genes'], cl_means=c['cl_means'], lfc_th=c['lfc_th'],
+        de=de, max_num=c['max_num'],
+    )
+    cache = _marker_cache_path(c['out_dir'], cl)
+    if cache:
+        with open(cache, "w") as fh:
+            json.dump(markers, fh)
+    return cl, markers

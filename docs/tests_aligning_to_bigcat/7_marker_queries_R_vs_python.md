@@ -12,6 +12,12 @@ genes differently. That is **not a disagreement** — it is tied scores at the a
 broken differently, at exactly the pick where ties first appear, so the tail order carries no
 information ([measured](#why-top-n-is-exact-and-the-greedy-tail-is-not)).
 
+The greedy family **with the fold-change check** (`cl.means` + `lfc.th`, the configuration of the
+production run `select_combo_markers.R`) is also exact on sets: **428/428 identical marker sets**, 427/428
+in the same order, the one exception again a 999 tie
+([details](#greedy-family-with-the-fold-change-check-clmeans-lfcth)). Converting the means to ln and
+the threshold to `2*ln(2)` — the recipe in `examples/3_de_all_pairs_example.py` — gives the same result.
+
 ## The two families
 
 Both answer "which genes mark this cluster", but they optimise different things.
@@ -104,6 +110,54 @@ carries no information; treat the combo output as a set.**
 
 Note the greedy sets are much larger than the top-N ones (up to 15 genes vs 3), because each cluster is
 being separated from **all 427** others and hard-to-separate neighbours each demand their own marker.
+
+### greedy family with the fold-change check (`cl.means`, `lfc.th`)
+
+The run above passes `cl.means=NULL`, so a gene counts as separating a pair when it is a **stored DE
+marker** for that pair (`check_pairs_ds`). The production run
+(`yzizhen/joint_analysis/wb_multi/select_combo_markers.R`) passes `cl.means` and `lfc.th=2`, which
+switches the check to the **cluster means**: a gene separates `P1` vs `P2` when
+`mean[g, P1] - mean[g, P2] > lfc.th` (`check_pairs_lfc`). That branch had only a unit test; this is the
+end-to-end comparison.
+
+Setup — both sides read the same DE dataset (`de_parquet_R_full_parallel`) and the same cluster means
+(R's own all-cells `cl.stats$means`, exported to `Rclstats_means.parquet`), so only the query code
+differs:
+
+| | |
+|---|---|
+| clusters | **all 428**, each vs the other 427 |
+| `n.markers` / `max.genes` | 1 / 50 (R's default `max.genes`) |
+| R | `cl.means` = log2 means, `lfc.th = 2` |
+| Python, arm **log2** | the same log2 means, `lfc_th = 2` — tests the port's code |
+| Python, arm **ln** | means × ln(2), `lfc_th = 2*ln(2)` — tests the recipe for this package's ln(CPM+1) means |
+
+| R vs Python | arm **log2** | arm **ln** |
+|---|---:|---:|
+| **identical marker set** | **428 / 428** | **428 / 428** |
+| identical list including order | 427 / 428 | 427 / 428 |
+| same first gene | 428 / 428 | 428 / 428 |
+| mean Jaccard (min) | 1.0000 (1.0000) | 1.0000 (1.0000) |
+| identical set size | 428 / 428 | 428 / 428 |
+
+The two Python arms are **identical to each other on every cluster**: converting the means to ln and the
+threshold to `2*ln(2)` flips no gene across the cutoff. Set sizes are small with the fold-change check
+(mean 2.49, max 8; 34 clusters need 1 gene, 212 need 2).
+
+**The single order difference is again a 999 tie.** Cluster 1:
+
+```
+R : Meis2 Nrn1 Ptprk Hs3st4 Sorcs3 Rplp1 Sv2b  Kcnh7
+Py: Meis2 Nrn1 Ptprk Hs3st4 Sorcs3 Rplp1 Kcnh7 Sv2b
+```
+
+Replaying it: after the six shared picks only two comparisons remain uncovered (1 vs 52, 1 vs 68), and
+the top candidates score `Kcnh7 999, Sv2b 999, Cntnap5c 998, ...`. Python breaks the tie by gene name
+(deviation 3), R by row order. Same set, arbitrary order — as in the run without the fold-change check.
+
+**Using it from Python** (the call in `examples/3_de_all_pairs_example.py`): pass `cl_means` as
+**clusters x genes** — the orientation `get_cluster_means` returns, not R's genes x clusters — and, since
+this package's means are ln(CPM+1), `lfc_th = 2*np.log(2)` for R's `lfc.th = 2`.
 
 ### Why top-N is exact and the greedy tail is not
 
@@ -201,6 +255,14 @@ way (its loop breaks on an empty `gene.score`).
 | `select_top_pos_markers_ds` | 428 clusters, n_markers=3 | **31 s** |
 | `select_pos_markers_ds` (Python) | 12 clusters vs 427, n_markers=1, max_genes=20 | 36 s |
 | `select_pos_markers_ds` (R) | same | 93 s |
+| `select_pos_markers_ds` (R), with `cl.means` | 428 clusters vs 427, max.genes=50, `mc.cores=16` | 257 s |
+| `select_pos_markers_ds` (Python), with `cl_means` | same, serial (`n_jobs=1`) | 974 s |
+| `select_pos_markers_ds` (Python), with `cl_means` | same, `n_jobs=8` | **335 s** (2.9x), output identical to serial on 428/428 |
+
+`n_jobs` parallelises over clusters, as R's `mc.cores` does; each cluster is independent, so the result
+does not depend on the worker count (verified on all 428 clusters, order included). Speedup is below 8x
+because a few clusters need many greedy rounds and each worker reads its clusters' rows from the shared
+filesystem. The serial and 8-worker runs were on different nodes (n263, n262), so read 2.9x as indicative.
 
 The top-N variant scales well because it is a single streaming pass. The greedy variant is inherently
 sequential per cluster — each pick depends on the previous one — so it costs roughly as much for 12
@@ -223,6 +285,10 @@ python _markers_py.py de_parquet_R_full_parallel R markers_pyimpl_on_Rdata.csv
 python _compare_markers.py                    # top-N comparison
 python _compare_combo_markers.py              # greedy comparison
 sbatch _tie_check.sh                          # why top-N is exact and the greedy tail is not
+# greedy with the fold-change check (cl.means + lfc.th); needs Rclstats_means.parquet (_export_clstats_R.sh)
+sbatch _combo_markers_lfc_R.sh 0 50 2 16      # R            -> combo_markers_lfc_R.csv
+sbatch _combo_markers_lfc_py.sh 0 50          # Python, log2 + ln arms -> combo_markers_lfc_py_{log2,ln}.csv
+python _compare_combo_lfc.py
 ```
 
 Tests: `tests/test_de_all_pairs.py` — `test_select_top_pos_markers_ds_ranks_by_breadth_then_rank`,
